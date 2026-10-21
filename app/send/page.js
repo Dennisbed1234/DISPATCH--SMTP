@@ -52,7 +52,7 @@ export default function SendPage() {
             <label>HTML payload</label>
             <textarea rows={10} value={html} onChange={(e) => setHtml(e.target.value)} />
             <button type="submit" className="button" disabled={sending} style={{ marginTop: 14 }}>
-              {sending ? 'Transmitting…' : 'Send via Gmail'}
+              {sending ? 'Transmitting…' : 'Send via Google Workspace'}
             </button>
           </form>
           {result && <div className="result">{result}</div>}
