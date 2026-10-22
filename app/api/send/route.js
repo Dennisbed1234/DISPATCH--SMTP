@@ -3,7 +3,6 @@ const {
   sendEmail,
   isMailConfigured,
   getMailConfig,
-  personalize,
   sendDelayMs,
   delay,
 } = require('../../../lib/mailer');
@@ -50,7 +49,6 @@ function injectTracking(html, emailId) {
 
   let out = String(html);
 
-  // Rewrite links (skip mailto, already-tracked, and the pixel itself)
   out = out.replace(
     /href\s*=\s*["'](https?:\/\/[^"']+)["']/gi,
     (match, url) => {
@@ -86,15 +84,15 @@ export async function POST(request) {
     }
     const body = await request.json();
     const recipients = parseRecipients(body.to).slice(0, 500);
-    const subjectTpl = String(body.subject || '').trim();
-    const htmlTpl = body.html ? String(body.html) : undefined;
-    const textTpl =
+    const subject = String(body.subject || '').trim();
+    let html = body.html ? String(body.html) : undefined;
+    const text =
       body.text || body.message
         ? String(body.text || body.message)
         : undefined;
     const dryRun = Boolean(body.dryRun);
 
-    if (!recipients.length || !subjectTpl || (!htmlTpl && !textTpl)) {
+    if (!recipients.length || !subject || (!html && !text)) {
       return Response.json(
         { error: 'to, subject, and html or text required' },
         { status: 400 }
@@ -108,7 +106,7 @@ export async function POST(request) {
         wouldSend: recipients.length,
         recipients: recipients.map((r) => ({
           email: r.email,
-          subject: personalize(subjectTpl, { name: r.name, email: r.email }),
+          subject,
         })),
       });
     }
@@ -117,17 +115,13 @@ export async function POST(request) {
     const results = [];
     for (let i = 0; i < recipients.length; i++) {
       const r = recipients[i];
-      const vars = { name: r.name, email: r.email };
-      const subject = personalize(subjectTpl, vars);
-      let html = htmlTpl ? personalize(htmlTpl, vars) : undefined;
-      const text = textTpl ? personalize(textTpl, vars) : undefined;
       const emailId = crypto.randomUUID();
-      if (html) html = injectTracking(html, emailId);
+      const trackedHtml = html ? injectTracking(html, emailId) : undefined;
 
       const result = await sendEmail({
         to: r.email,
         subject,
-        html,
+        html: trackedHtml,
         text,
         fromName: body.fromName,
       });
@@ -138,7 +132,7 @@ export async function POST(request) {
             sender: cfg.fromEmail || cfg.user,
             recipient: r.email,
             subject,
-            html,
+            html: trackedHtml,
             text,
             status: 'delivered',
             messageId: result.messageId,
@@ -156,7 +150,7 @@ export async function POST(request) {
             sender: cfg.fromEmail || cfg.user,
             recipient: r.email,
             subject,
-            html,
+            html: trackedHtml,
             text,
             status: 'failed',
             error: result.error,
