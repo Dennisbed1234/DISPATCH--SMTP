@@ -7,7 +7,7 @@ const {
   delay,
 } = require('../../../lib/mailer');
 const { logEmail } = require('../../../lib/store');
-const { hasDatabase } = require('../../../lib/db');
+const { hasDatabase, query, ensureEmailTrackingColumns } = require('../../../lib/db');
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -37,11 +37,61 @@ function parseRecipients(to) {
 }
 
 function appBase() {
-  const raw = (process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || '').trim();
-  return raw.replace(/\/$/, '');
+  const raw = (
+    process.env.APP_URL ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    process.env.VERCEL_PROJECT_PRODUCTION_URL ||
+    process.env.VERCEL_URL ||
+    ''
+  ).trim();
+  if (!raw) return '';
+  let u = raw.replace(/\/$/, '');
+  if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+  return u;
 }
 
-/** Append open pixel + rewrite http(s) links through /api/track/click */
+function classifyFailure(message) {
+  const m = String(message || '');
+  if (
+    /550|551|552|553|user unknown|mailbox unavailable|does not exist|no such user|invalid recipient|recipient rejected|address rejected/i.test(
+      m
+    )
+  ) {
+    return { bounceType: 'hard', status: 'bounced' };
+  }
+  if (
+    /421|450|451|452|try again|temporarily|greylist|rate limit|too many|deferred/i.test(
+      m
+    )
+  ) {
+    return { bounceType: 'soft', status: 'failed' };
+  }
+  return { bounceType: null, status: 'failed' };
+}
+
+async function isSuppressed(email) {
+  if (!hasDatabase()) return false;
+  try {
+    await ensureEmailTrackingColumns();
+    const { rows } = await query(
+      `SELECT 1 FROM emails
+       WHERE lower(trim(recipient)) = $1
+         AND (
+           unsubscribed_at IS NOT NULL
+           OR lower(status) = 'unsubscribed'
+           OR lower(status) = 'bounced'
+           OR lower(COALESCE(bounce_type,'')) = 'hard'
+         )
+       LIMIT 1`,
+      [email.toLowerCase()]
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Open pixel + click rewrite + unsubscribe footer */
 function injectTracking(html, emailId) {
   if (!html || !emailId) return html;
   const base = appBase();
@@ -60,9 +110,16 @@ function injectTracking(html, emailId) {
     }
   );
 
+  if (!out.includes('/api/track/unsubscribe')) {
+    const href = `${base}/api/track/unsubscribe?id=${encodeURIComponent(emailId)}`;
+    const block = `<p style="margin:24px 0 0;font-size:11px;line-height:1.5;color:#6b7280;text-align:center;">If you no longer want these emails, <a href="${href}" style="color:#6b7280;text-decoration:underline;">unsubscribe</a>.</p>`;
+    if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${block}</body>`);
+    else out = `${out}${block}`;
+  }
+
   const pixel = `<img src="${base}/api/track/open?id=${encodeURIComponent(
     emailId
-  )}" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;" />`;
+  )}&t=${Date.now()}" width="1" height="1" alt="" border="0" style="width:1px;height:1px;border:0;opacity:0;" />`;
   if (/<\/body>/i.test(out)) {
     out = out.replace(/<\/body>/i, `${pixel}</body>`);
   } else {
@@ -83,7 +140,7 @@ export async function POST(request) {
       );
     }
     const body = await request.json();
-    const recipients = parseRecipients(body.to).slice(0, 500);
+    let recipients = parseRecipients(body.to).slice(0, 500);
     const subject = String(body.subject || '').trim();
     let html = body.html ? String(body.html) : undefined;
     const text =
@@ -91,6 +148,9 @@ export async function POST(request) {
         ? String(body.text || body.message)
         : undefined;
     const dryRun = Boolean(body.dryRun);
+    const campaignId =
+      String(body.campaignId || body.campaign || '').trim() ||
+      `camp_${Date.now().toString(36)}`;
 
     if (!recipients.length || !subject || (!html && !text)) {
       return Response.json(
@@ -99,11 +159,24 @@ export async function POST(request) {
       );
     }
 
+    let skippedSuppressed = 0;
+    const kept = [];
+    for (const r of recipients) {
+      if (await isSuppressed(r.email)) {
+        skippedSuppressed += 1;
+        continue;
+      }
+      kept.push(r);
+    }
+    recipients = kept;
+
     if (dryRun) {
       return Response.json({
         success: true,
         dryRun: true,
+        campaignId,
         wouldSend: recipients.length,
+        skippedSuppressed,
         recipients: recipients.map((r) => ({
           email: r.email,
           subject,
@@ -112,18 +185,26 @@ export async function POST(request) {
     }
 
     const cfg = getMailConfig();
+    const base = appBase();
     const results = [];
     for (let i = 0; i < recipients.length; i++) {
       const r = recipients[i];
       const emailId = crypto.randomUUID();
+      const unsubUrl = base
+        ? `${base}/api/track/unsubscribe?id=${encodeURIComponent(emailId)}`
+        : undefined;
       const trackedHtml = html ? injectTracking(html, emailId) : undefined;
+      const textWithUnsub =
+        text && unsubUrl ? `${text}\n\nUnsubscribe: ${unsubUrl}` : text;
 
+      // Pass unsubscribe into mailer via headers if supported — extend sendEmail call
       const result = await sendEmail({
         to: r.email,
         subject,
         html: trackedHtml,
-        text,
+        text: textWithUnsub,
         fromName: body.fromName,
+        listUnsubscribe: unsubUrl,
       });
       if (result.success) {
         if (hasDatabase()) {
@@ -133,9 +214,10 @@ export async function POST(request) {
             recipient: r.email,
             subject,
             html: trackedHtml,
-            text,
+            text: textWithUnsub,
             status: 'delivered',
             messageId: result.messageId,
+            campaignId,
           });
         }
         results.push({
@@ -144,6 +226,7 @@ export async function POST(request) {
           messageId: result.messageId,
         });
       } else {
+        const { bounceType, status } = classifyFailure(result.error);
         if (hasDatabase()) {
           await logEmail({
             id: emailId,
@@ -151,15 +234,18 @@ export async function POST(request) {
             recipient: r.email,
             subject,
             html: trackedHtml,
-            text,
-            status: 'failed',
+            text: textWithUnsub,
+            status,
             error: result.error,
+            campaignId,
+            bounceType,
           });
         }
         results.push({
           recipient: r.email,
           success: false,
           error: result.error,
+          status,
         });
       }
       if (i < recipients.length - 1) await delay(sendDelayMs());
@@ -172,8 +258,12 @@ export async function POST(request) {
       total: results.length,
       sent,
       failed,
+      skippedSuppressed,
+      campaignId,
       results,
-      tracking: Boolean(appBase()),
+      tracking: Boolean(base),
+      note:
+        'SMTP accepted ≠ inbox delivery. Opens need HTML + APP_URL. Unsubscribes are tracked.',
     });
   } catch (e) {
     return Response.json({ error: e.message }, { status: 500 });
@@ -206,5 +296,6 @@ export async function GET() {
     from: cfg.fromEmail,
     database: hasDatabase(),
     appUrl: appBase() || null,
+    features: ['open', 'click', 'unsubscribe', 'bounce_classify', 'campaignId'],
   });
 }
